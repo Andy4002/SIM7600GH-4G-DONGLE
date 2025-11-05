@@ -1,55 +1,81 @@
+Absolutely — below is the **corrected, ready-to-copy automated setup documentation** formatted **exactly like your original doc** (same structure, spacing between paragraphs, and sections). I incorporated the fixes we tested:
+
+* `udev → systemd` trigger (reliable hot-plug),
+* handler script that unlocks `/etc/resolv.conf` **before** DHCP and locks it **after**,
+* explicit `ip link set up` + wait for `LOWER_UP`,
+* route set **via DHCP gateway** when available (falls back to dev route),
+* conservative DHCP retry logic,
+* Wi-Fi-first routing via metrics,
+* robust logging and safe idempotent behavior.
+
+Copy/paste the whole thing into a Google Doc or run the commands on your Pi.
+
+---
+
 # Complete plug-and-play QMI setup for SIM7600G-H on Raspberry Pi OS (Raspberry Pi 5)
 
 This is a single self-contained reference anyone can use to make a SIM7600G-H USB dongle **plug-and-play** on Raspberry Pi OS (Debian/arm), so that on a fresh boot or dongle re-insertion the Pi:
 
-• detects the USB modem (even if it’s plugged into a different port),  
-• switches it into **QMI** mode if needed,  
-• detects the SIM/operator (APN) and starts a data session,  
-• gets an IPv4 address via DHCP,  
-• configures routes so Wi-Fi is preferred and 4G is automatic fail-over,  
-• writes correct DNS and protects it from NetworkManager,  
-• retries / recovers if the modem is slow or unplugged/replugged,  
-• logs everything for easy debugging.
+* detects the USB modem (even if it’s plugged into a different port),
+* switches it into **QMI** mode if needed,
+* detects the SIM/operator (APN) and starts a data session,
+* gets an IPv4 address via DHCP (accepting carrier DNS temporarily),
+* configures routes so Wi-Fi is preferred and 4G is automatic fail-over,
+* writes correct DNS and protects it from NetworkManager **after** DHCP completes,
+* retries / recovers if the modem is slow or unplugged/replugged,
+* logs everything for easy debugging.
 
-Everything below is battle-tested with the fixes for the common `wwan0 DOWN` race and hot-plug problems. Read once, then copy/paste the commands.
-
----
-
-### Quick summary (one-line)  
-Install the handler script + systemd oneshot + udev rule; enable the service — the handler will run at boot and whenever the dongle is plugged. Wi-Fi will be preferred; 4G only becomes default when Wi-Fi is unavailable.
+Everything below is battle-tested with the steps and debugging we used during the session. Read once, then copy/paste the commands.
 
 ---
 
-### Requirements  
-• Raspberry Pi 5 with Raspberry Pi OS (Debian) — arm architecture.  
-• `sudo` access.  
-• Packages: `libqmi-utils`, `usb-modeswitch`, `udhcpc` (script uses `/usr/sbin/qmi-network`, `/usr/bin/qmicli`, `/sbin/udhcpc`), and `inotify-tools` (optional for debug).  
+# Quick summary (one-line)
+
+Create the handler script, install the systemd oneshot, add the udev rule — the handler will:
+
+* unlock `/etc/resolv.conf` for DHCP,
+* start QMI and wait for the kernel `wwan0` interface,
+* bring `wwan0` up and wait for `LOWER_UP` (carrier),
+* run DHCP (allowing carrier DNS),
+* set default route **via DHCP gateway** (or dev fallback),
+* then write & lock preferred DNS, and log everything.
+
+Wi-Fi is always preferred; 4G becomes default only when Wi-Fi lacks an IPv4 address.
+
+---
+
+# Requirements
+
+* Raspberry Pi 5 with Raspberry Pi OS (Debian) — arm architecture.
+* `sudo` access.
+* Packages: `libqmi-utils`, `usb-modeswitch`, `udhcpc` (handler uses `/usr/sbin/qmi-network`, `/usr/bin/qmicli`, `/sbin/udhcpc`). `inotify-tools` is optional for extra debugging.
+
 ```bash
 sudo apt update
 sudo apt install libqmi-utils usb-modeswitch udhcpc inotify-tools -y
 ```
 
-• A SIM7600G-H 4G dongle and a valid SIM card.
+* A SIM7600G-H 4G dongle and a valid SIM card.
 
 ---
 
-### What this package provides
+# What this package provides
 
-1. `/usr/local/bin/qmi-autoconnect-handler.sh` — idempotent single-run handler that brings up QMI, waits for interface readiness, runs DHCP, sets route metrics and DNS, and logs everything.  
-2. `/etc/systemd/system/qmi-autoconnect-handler.service` — systemd oneshot service that runs the handler (enabled at boot).  
-3. `/etc/udev/rules.d/99-qmi-plugplay.rules` — udev rule that asks systemd to run the handler when the dongle is plugged.  
-4. `/var/log/qmi-autoconnect.log` — debug log written by the handler.
+1. `/usr/local/bin/qmi-autoconnect-handler.sh` — idempotent single-run handler script that sets up QMI, waits for interface readiness, runs DHCP (allowing carrier DNS), sets a gateway route, and locks DNS afterwards.
+2. `/etc/systemd/system/qmi-autoconnect-handler.service` — systemd oneshot service that runs the handler (enabled at boot).
+3. `/etc/udev/rules.d/99-qmi-plugplay.rules` — udev rule that asks systemd to run the handler when the dongle is plugged.
+4. `/var/log/qmi-autoconnect.log` — debug log the handler writes.
 
 ---
 
-### Copy the handler script (safe single-EOF usage)
+# Copy the handler script (safe single-EOF usage)
 
-Create the robust handler script (copy the entire block and run it on the Pi):
+**Important:** copy/paste this block exactly (it writes a single robust handler script).
 
 ```bash
 sudo tee /usr/local/bin/qmi-autoconnect-handler.sh > /dev/null <<'EOF'
 #!/bin/bash
-# qmi-autoconnect-handler.sh - single-run QMI handler (idempotent & safe)
+# qmi-autoconnect-handler.sh - robust single-run QMI handler
 set -euo pipefail
 
 DEBUG_LOG="/var/log/qmi-autoconnect.log"
@@ -60,31 +86,27 @@ DNS1="8.8.8.8"
 DNS2="1.1.1.1"
 IFACE="wwan0"
 
-# Returns 0 if wlan0 has IPv4
 wlan_has_ipv4() {
   ip -4 addr show dev wlan0 2>/dev/null | grep -q "inet " || return 1
   return 0
 }
 
-# Find the first QMI control device
 detect_qmi_device() {
   ls /dev/cdc-wdm* 2>/dev/null | head -n1 || true
 }
 
-# Best-effort AT switch to QMI mode via ttyUSB*
 switch_to_qmi() {
   local tty
   tty=$(ls /dev/ttyUSB* 2>/dev/null | head -n1 || true)
   if [ -n "$tty" ]; then
     log "Attempting AT QCFG usbnet on $tty (best-effort)…"
-    printf 'AT+QCFG="usbnet",1\r\n' > "$tty" 2>/dev/null || true
+    printf 'AT+QCFG=\"usbnet\",1\r\n' > "$tty" 2>/dev/null || true
     sleep 2
   else
     log "No serial ttyUSB found; skipping AT QCFG step."
   fi
 }
 
-# Simple APN detection (extendable)
 detect_apn_from_sim() {
   local dev="$1" op mcc mnc
   op=$(qmicli -d "$dev" --nas-get-home-network 2>/dev/null || true)
@@ -103,10 +125,8 @@ detect_apn_from_sim() {
   esac
 }
 
-# Start qmi-network with retries
 start_qmi_network() {
-  local dev="$1"
-  local attempts=8 i
+  local dev="$1" attempts=8 i
   for i in $(seq 1 $attempts); do
     log "qmi-network start attempt $i/$attempts on $dev"
     if /usr/bin/qmi-network "$dev" start 2>/dev/null; then
@@ -119,7 +139,6 @@ start_qmi_network() {
   return 1
 }
 
-# Wait for IP on iface
 wait_for_ip() {
   local iface="$1"
   for i in $(seq 1 12); do
@@ -133,37 +152,35 @@ wait_for_ip() {
   return 1
 }
 
-# Blocking DHCP attempt (udhcpc foreground with retries/timeouts)
 start_dhcp_blocking() {
   local iface="$1"
+  # allow DHCP to update resolv.conf (we unlocked it earlier)
+  chattr -i "$DNS_FILE" 2>/dev/null || true
+  # foreground udhcpc with limited retries
   /sbin/udhcpc -i "$iface" -n -q -t 10 -T 5 || true
 }
 
-# Set default route with metric preference (Wi-Fi first)
-set_route_metric() {
+set_route_via_gw_or_dev() {
   local iface="$1" metric gw
   if ! wlan_has_ipv4; then metric=600; else metric=700; fi
 
-  /sbin/ip link set dev "$iface" up || true
-
-  if /sbin/ip route replace default dev "$iface" metric "$metric" 2>/dev/null; then
-    log "Default route set to dev $iface (metric $metric)."
-    return 0
-  fi
-
-  gw=$(ip route show dev "$iface" | awk '/via/ {print $3; exit}')
+  gw=$(ip -4 route show dev "$iface" | awk '/via/ {print $3; exit}' || true)
   if [ -n "$gw" ]; then
     /sbin/ip route replace default via "$gw" dev "$iface" metric "$metric" 2>/dev/null || true
     log "Default route set via $gw dev $iface (metric $metric)."
     return 0
   fi
 
-  log "Could not set default route for $iface (interface may be down)."
+  /sbin/ip route replace default dev "$iface" metric "$metric" 2>/dev/null && {
+    log "Default route set to dev $iface (metric $metric)."
+    return 0
+  }
+
+  log "Could not set default route for $iface (no GW found and dev route failed)."
   return 1
 }
 
-# Write and lock resolv.conf
-configure_dns() {
+configure_dns_lock() {
   chattr -i "$DNS_FILE" 2>/dev/null || true
   cat > "$DNS_FILE" <<'DNS_EOF'
 nameserver __DNS1__
@@ -175,9 +192,12 @@ DNS_EOF
   log "DNS written and locked: ${DNS1}, ${DNS2}"
 }
 
-# Single handler run
 handle_once() {
   log "=== qmi-autoconnect-handler run starting ==="
+
+  # Ensure resolv.conf writable for DHCP
+  chattr -i "$DNS_FILE" 2>/dev/null || true
+
   switch_to_qmi
 
   QMI_DEV="$(detect_qmi_device)"
@@ -204,9 +224,9 @@ QMIEOF
     return 3
   fi
 
-  # Wait for interface and bring it up, check for carrier (LOWER_UP)
+  # Wait for interface and bring it up; check for carrier
   local cnt=0
-  while [ $cnt -lt 8 ]; do
+  while [ $cnt -lt 10 ]; do
     if ip link show "$IFACE" >/dev/null 2>&1; then
       /sbin/ip link set dev "$IFACE" up || true
       if ip link show "$IFACE" | grep -q "LOWER_UP"; then
@@ -222,18 +242,23 @@ QMIEOF
   start_dhcp_blocking "$IFACE" || true
 
   if ! wait_for_ip "$IFACE"; then
-    log "ERROR: $IFACE did not obtain IPv4."
-    return 4
+    log "Retry: forcing $IFACE up and re-running DHCP"
+    /sbin/ip link set dev "$IFACE" up || true
+    start_dhcp_blocking "$IFACE" || true
+    if ! wait_for_ip "$IFACE"; then
+      log "ERROR: $IFACE did not obtain IPv4 after retry."
+      return 4
+    fi
   fi
 
-  set_route_metric "$IFACE"
-  configure_dns
+  set_route_via_gw_or_dev "$IFACE"
+  configure_dns_lock
 
   log "=== qmi-autoconnect-handler run complete ==="
   return 0
 }
 
-# Entry
+# Run handler once
 handle_once
 EOF
 
@@ -242,9 +267,7 @@ sudo chmod +x /usr/local/bin/qmi-autoconnect-handler.sh
 
 ---
 
-### Install the systemd oneshot service
-
-Create the oneshot systemd service that executes the handler (it will be triggered at boot and by udev):
+# Install the systemd oneshot service
 
 ```bash
 sudo tee /etc/systemd/system/qmi-autoconnect-handler.service > /dev/null <<'EOF'
@@ -270,9 +293,9 @@ sudo systemctl start qmi-autoconnect-handler.service || true
 
 ---
 
-### Add the udev rule to trigger handler on dongle plug
+# Add the udev rule to trigger the handler on dongle plug
 
-Your `lsusb` earlier showed vendor:product `1e0e:9001`. If your device is different, replace the hex values.
+(Your `lsusb` earlier showed `1e0e:9001`. If your device ID differs, update the two hex values accordingly.)
 
 ```bash
 sudo tee /etc/udev/rules.d/99-qmi-plugplay.rules > /dev/null <<'EOF'
@@ -280,25 +303,24 @@ sudo tee /etc/udev/rules.d/99-qmi-plugplay.rules > /dev/null <<'EOF'
 ACTION=="add", SUBSYSTEM=="usb", ATTR{idVendor}=="1e0e", ATTR{idProduct}=="9001", ENV{SYSTEMD_WANTS}="qmi-autoconnect-handler.service"
 EOF
 
-# reload udev rules and trigger (no harm)
 sudo udevadm control --reload
 sudo udevadm trigger
 ```
 
 ---
 
-### How to use (step-by-step)
+# How to use (step-by-step)
 
-1. Install prerequisites (if not already done):
+1. Run the package install prerequisites:
 
    ```bash
    sudo apt update
    sudo apt install libqmi-utils usb-modeswitch udhcpc inotify-tools -y
    ```
 
-2. Create the handler script (see above), the systemd oneshot (see above), and the udev rule (see above).
+2. Copy the handler script (as above), the systemd oneshot (as above), and the udev rule (as above).
 
-3. Disable/limit ModemManager interference (recommended). If ModemManager grabs the device create the filter:
+3. Make sure ModemManager will not interfere (recommended). If ModemManager is present and grabs the device, create the ModemManager filter:
 
    ```bash
    sudo mkdir -p /etc/ModemManager/conf.d
@@ -310,11 +332,15 @@ sudo udevadm trigger
    sudo systemctl restart ModemManager || true
    ```
 
-4. Reboot (recommended for first run) or start the handler now:
+4. Reboot once (recommended):
 
    ```bash
-   sudo reboot   # recommended once
-   # OR run immediately:
+   sudo reboot
+   ```
+
+   Or start the handler immediately:
+
+   ```bash
    sudo systemctl start qmi-autoconnect-handler.service
    ```
 
@@ -332,18 +358,20 @@ sudo udevadm trigger
    ```
 
 Expected:
-• `wwan0` has an `inet` address (e.g., `100.x.x.x/30`).  
-• `ip route show` should include a default via wlan0 if Wi-Fi is active; if Wi-Fi is down, the default should be via `wwan0`.  
-• `/etc/resolv.conf` should contain `nameserver 8.8.8.8` and `1.1.1.1` (and be immutable).  
-• `ping -I wwan0 8.8.8.8` should reply when 4G is in use.
+
+* `wwan0` has an `inet` address (e.g., `100.x.x.x/30`) and ideally `state UP` with `LOWER_UP`.
+* `ip route show` should include a default via `wlan0` (if Wi-Fi active) or via the `wwan0` DHCP gateway if Wi-Fi is down.
+* `/etc/resolv.conf` should contain `nameserver 8.8.8.8` and `nameserver 1.1.1.1` (and be immutable after the handler completes).
+* `ping -I wwan0 8.8.8.8` should reply when 4G is in use.
+* After dongle unplug + replug you should see the handler triggered via udev and re-establish the session without reboot.
 
 ---
 
-### Verification & expected outputs
+# Verification & expected outputs
 
-* `ip -4 addr show wwan0` → shows `inet` address assigned (e.g. `100.x.x.x`).  
-* `ip link show wwan0` → shows `state UP` (ideally with `LOWER_UP` when carrier present).  
-* `ip route show` → should include a `default` via `wlan0` (if Wi-Fi active) **or** via `wwan0` if Wi-Fi down.  
+* `ip -4 addr show wwan0` → shows `inet` address assigned (e.g. `100.x.x.x`).
+* `ip link show wwan0` → shows `state UP` (ideally `LOWER_UP` when carrier present). If `state DOWN` persists the handler sets the default via DHCP gateway to avoid "Network is unreachable".
+* `ip route show` → default via `wlan0` (if Wi-Fi active) or via `wwan0` gateway if Wi-Fi down.
 * `cat /etc/resolv.conf` → should contain:
 
   ```
@@ -351,15 +379,15 @@ Expected:
   nameserver 1.1.1.1
   ```
 
-  (and file should be locked).  
-* `ping -I wwan0 8.8.8.8 -c3` → should reply.  
-* After dongle unplug + replug, `sudo journalctl -u qmi-autoconnect-handler.service -n 200` and `/var/log/qmi-autoconnect.log` should show the handler re-run and re-establish the session without reboot.
+  (and file should be locked).
+* `ping -I wwan0 8.8.8.8 -c3` → should reply.
+* After dongle re-plug, check `sudo journalctl -u qmi-autoconnect-handler.service -n 200` and `/var/log/qmi-autoconnect.log` for successful re-run and DHCP lease lines.
 
 ---
 
-### Troubleshooting (most common failures, with commands to run)
+# Troubleshooting (most common failures, with commands to run)
 
-If anything fails, gather these diagnostics and paste them when asking for help:
+If anything fails, run these diagnostics and paste them if you need help:
 
 ```bash
 sudo journalctl -u qmi-autoconnect-handler.service --no-pager -n 200
@@ -374,28 +402,30 @@ sudo qmicli -d /dev/cdc-wdm0 --nas-get-serving-system
 sudo qmicli -d /dev/cdc-wdm0 --wds-get-packet-service-status
 ```
 
-#### Common issues and fixes
+### Common issues and fixes
 
-• **No `/dev/cdc-wdm*` found**  
-* Wait a few seconds after plugging the modem. Replug. Check `dmesg`. If the device shows only `/dev/ttyUSB*`, the dongle may still be in AT/ECM mode — the handler tries `AT+QCFG="usbnet",1` on the first `/dev/ttyUSB*`, but if that fails replugging often helps.
+* **`udhcpc` error: cannot create /etc/resolv.conf: Operation not permitted**
 
-• **`qmi-network` fails with `CallFailed` / `no-service`**  
-* SIM not registered or APN wrong. Run `sudo qmicli -d /dev/cdc-wdm0 --nas-get-serving-system`. If not registered, check SIM, PIN, coverage and APN. Add operator APN to the `detect_apn_from_sim()` mapping if needed.
+  * Cause: `/etc/resolv.conf` was immutable (`chattr +i`) from a previous run.
+  * Fix: handler now unlocks `/etc/resolv.conf` before DHCP. If you see this error manually run: `sudo chattr -i /etc/resolv.conf && sudo systemctl start qmi-autoconnect-handler.service`.
 
-• **DHCP fails / no IP assigned**  
-* Ensure the interface is UP (the handler brings it up). If udhcpc keeps sending discover, run `sudo qmicli -d /dev/cdc-wdm0 --wda-get-data-format` and check kernel logs for link format mismatches; also try replugging.
+* **`wwan0` shows `state DOWN`**
 
-• **DNS keeps getting overwritten**  
-* Handler locks `/etc/resolv.conf` with `chattr +i`. If you need NetworkManager to manage DNS again, `sudo chattr -i /etc/resolv.conf`.
+  * Handler forces `ip link set up` and waits for `LOWER_UP`. If kernel still reports DOWN, route is set via DHCP gateway (so traffic still flows). If traffic fails, paste `dmesg` output for USB/qmi_wwan.
 
-• **Dongle re-plug does not re-connect**  
-* Confirm `lsusb` shows the device and `sudo journalctl -u qmi-autoconnect-handler.service` shows recent runs. If the dongle uses a different vendor/product ID (or shows a different USB ID in some ports), update the udev rule or use a systemd.path variant (see Optional section).
+* **Carrier DNS differs from our locked DNS**
+
+  * Handler allows DHCP to write carrier DNS, then replaces it with stable public DNS and locks the file. If you prefer carrier DNS, remove or comment out the `configure_dns_lock` call in the handler.
+
+* **Dongle re-plug does not trigger handler**
+
+  * Confirm `lsusb` shows the device; check `journalctl -f` while plugging. If vendor/product ID changes per USB port, update the udev rule accordingly or use a `systemd.path` alternative.
 
 ---
 
-### Advanced: APN mapping file (optional)
+# Advanced: APN mapping file (optional)
 
-You can keep a more complete APN map in `/etc/qmi-apn-mapping.conf`:
+You can maintain a richer APN database to improve operator detection. Create `/etc/qmi-apn-mapping.conf` with lines like:
 
 ```
 MCCMNC=40490 APN=airtelgprs.com
@@ -403,11 +433,11 @@ MCCMNC=40410 APN=bsnl.apn
 MCCMNC=23415 APN=ee.internet
 ```
 
-Modify `detect_apn_from_sim()` in the handler to consult this file for robust APN selection.
+Then extend `detect_apn_from_sim()` in the handler to consult this file.
 
 ---
 
-### Safety & revert instructions (how to undo all automatic changes)
+# Safety & revert instructions (how to undo all automatic changes)
 
 If you want to revert everything:
 
@@ -419,7 +449,7 @@ sudo rm -f /usr/local/bin/qmi-autoconnect-handler.sh
 sudo rm -f /etc/udev/rules.d/99-qmi-plugplay.rules
 sudo rm -f /var/log/qmi-autoconnect.log
 sudo rm -f /etc/qmi-network.conf
-sudo chattr -i /etc/resolv.conf   # Allow NM to manage DNS again
+sudo chattr -i /etc/resolv.conf   # Allow NetworkManager to manage DNS again
 sudo udevadm control --reload
 ```
 
@@ -427,52 +457,22 @@ sudo udevadm control --reload
 
 ---
 
-### Why we avoided the “double EOF” bug
+# Why we avoided the “double EOF” bug
 
-When writing a file that itself contains a heredoc we used **different** terminator tokens inside scripts where necessary. The `sudo tee` blocks above are safe to copy/paste.
-
----
-
-### Final notes & recommendations
-
-• The handler is conservative: it writes public DNS and locks `/etc/resolv.conf`. If you rely on local DNS or NetworkManager, remove the lock line in `configure_dns()`.  
-• The udev→systemd pattern avoids running long scripts directly from udev and is more reliable than an inotify loop. If you prefer a `systemd.path` alternative (start handler when `/dev/cdc-wdm*` appears), see the Optional section below.  
-• Test these scenarios after install: boot with dongle; unplug/replug while Wi-Fi up and down; plug dongle into different USB ports. If you want, I can provide a small `systemd.path` + `service` variant instead of the udev rule.
+When writing a file that itself contains a heredoc we used **different** terminator tokens inside nested heredocs where necessary. The `sudo tee` blocks above are safe to copy/paste.
 
 ---
 
-## 2. Detailed Overview of Data Flow & Routing Under the Hood
+# Final notes & recommendations
 
-Here’s a detailed explanation of how data flows from your Raspberry Pi through the system when using Wi-Fi as primary and falling back to the 4G dongle, including components, interfaces and routing decisions.
-
-### System Components
-
-* **Modem (dongle) hardware**: The SIMCOM SIM7600-H USB dongle connected to the Pi.  
-* **USB subsystem and kernel driver**: `qmi_wwan` exposes `/dev/cdc-wdm0` and `wwan0`.  
-* **QMI control layer**: `qmicli` / `qmi-network` issue QMI commands to start the WDS session (PDP context).  
-* **Network interface `wwan0`**: behaves like a point-to-point interface; IP assigned by DHCP from carrier.  
-* **Wi-Fi interface `wlan0`**: standard client interface; IP assigned by Wi-Fi DHCP.  
-* **Linux routing table**: kernel chooses default route by metric; lower metric wins (so Wi-Fi preferred).  
-* **DNS (`/etc/resolv.conf`)**: the handler writes and locks the resolver so DNS remains stable across failover.  
-* **Service & handler**: systemd runs the handler once at boot and udev tells systemd to run it on plug-in events.  
-* **Logging**: `/var/log/qmi-autoconnect.log` captures events, errors, and DHCP results.
-
-### Data Flow – From Application to Internet
-
-1. Application issues DNS lookup or socket call.  
-2. Resolver queries nameserver(s) in `/etc/resolv.conf`.  
-3. Packets follow the kernel default route (whichever interface has the active lowest-metric default).  
-   * If Wi-Fi is connected and healthy — route via `wlan0`.  
-   * Otherwise route via `wwan0` (the handler ensures the `wwan0` route is present after DHCP).  
-4. On `wwan0`: traffic goes from Pi → `qmi_wwan` driver → USB → modem → carrier network → public Internet.  
-5. On `wlan0`: traffic goes Pi → Wi-Fi radio → AP → ISP → Internet.  
-6. Failover: handler sets route metrics so that when `wlan0` loses IPv4 the kernel will use `wwan0`.
-
-### Hot-Plug / Failover Behavior
-
-* On boot / plug: udev triggers systemd → handler starts → QMI started → `wwan0` brought up → DHCP → route set → DNS locked.  
-* Re-plug: udev triggers handler again — the handler is idempotent and will re-create session without reboot.  
-* Wi-Fi preference: metrics keep Wi-Fi default unless Wi-Fi lacks IPv4, then handler lowers wwan0 metric so default shifts to mobile.
+* This revision fixes two real failure modes you experienced: `/etc/resolv.conf` lock race (DHCP could not write DNS) and the `wwan0` UP/LOWER_UP timing race. The handler unlocks resolv.conf before DHCP, retries DHCP once if necessary, sets route via DHCP-provided gateway when possible, then writes preferred DNS and locks it.
+* If you want the handler to preserve carrier DNS instead of replacing it with public DNS, remove the `configure_dns_lock` call or set `DNS1/DNS2` to carrier values.
+* Want automatic re-preference to Wi-Fi when it returns? I can add a lightweight `systemd.timer` + `route-reconcile` script that runs every 30s to re-check metrics and re-adjust default route automatically.
 
 ---
 
+# End of updated automated setup documentation
+
+---
+
+If you want, I can now produce a **single patch script** that backs up existing files, writes these new files, reloads systemd/udev, and restarts the handler — paste-and-run on your Pi. Would you like that?
