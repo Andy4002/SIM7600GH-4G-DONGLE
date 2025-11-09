@@ -1,4 +1,3 @@
----
 
 # Complete Plug-and-Play QMI Setup for SIM7600G-H (Airtel + Jio) on Raspberry Pi OS (Raspberry Pi 5)
 
